@@ -6,10 +6,14 @@
 (define-constant ERR_INVALID_TRANSFER (err u104))
 (define-constant ERR_ALREADY_REGISTERED (err u105))
 (define-constant ERR_INVALID_STATUS (err u106))
+(define-constant ERR_RECALL_EXISTS (err u107))
+(define-constant ERR_RECALL_NOT_FOUND (err u108))
+(define-constant ERR_INVALID_SEVERITY (err u109))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-participant-id uint u1)
 (define-data-var next-transfer-id uint u1)
+(define-data-var next-recall-id uint u1)
 
 (define-map participants
   { participant-id: uint }
@@ -70,6 +74,29 @@
 (define-map product-quality-count
   { product-id: uint }
   { count: uint }
+)
+
+(define-map recalls
+  { recall-id: uint }
+  {
+    product-id: uint,
+    initiator: uint,
+    reason: (string-ascii 500),
+    severity-level: uint,
+    recall-date: uint,
+    status: (string-ascii 20),
+    affected-participants: (list 50 uint),
+    resolved: bool
+  }
+)
+
+(define-map recall-notifications
+  { recall-id: uint, participant-id: uint }
+  {
+    notified: bool,
+    acknowledged: bool,
+    acknowledgment-date: (optional uint)
+  }
 )
 
 (define-public (register-participant (participant-type (string-ascii 20)) (name (string-ascii 100)) (location (string-ascii 200)))
@@ -275,6 +302,14 @@
   (default-to { count: u0 } (map-get? product-quality-count { product-id: product-id }))
 )
 
+(define-read-only (get-recall (recall-id uint))
+  (map-get? recalls { recall-id: recall-id })
+)
+
+(define-read-only (get-recall-notification (recall-id uint) (participant-id uint))
+  (map-get? recall-notifications { recall-id: recall-id, participant-id: participant-id })
+)
+
 (define-read-only (is-participant-certified (participant-id uint))
   (match (map-get? participants { participant-id: participant-id })
     participant (get certified participant)
@@ -307,11 +342,125 @@
   )
 )
 
+(define-public (initiate-recall
+  (product-id uint)
+  (reason (string-ascii 500))
+  (severity-level uint)
+)
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_NOT_FOUND))
+      (caller-info (unwrap! (map-get? participant-by-address { address: tx-sender }) ERR_UNAUTHORIZED))
+      (initiator-id (get participant-id caller-info))
+      (recall-id (var-get next-recall-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (<= severity-level u5) ERR_INVALID_SEVERITY)
+    (asserts! (> (len reason) u0) ERR_INVALID_STATUS)
+    
+    (map-set recalls
+      { recall-id: recall-id }
+      {
+        product-id: product-id,
+        initiator: initiator-id,
+        reason: reason,
+        severity-level: severity-level,
+        recall-date: current-block,
+        status: "active",
+        affected-participants: (list),
+        resolved: false
+      }
+    )
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { status: "recalled" })
+    )
+    
+    (var-set next-recall-id (+ recall-id u1))
+    (ok recall-id)
+  )
+)
+
+(define-public (acknowledge-recall (recall-id uint))
+  (let
+    (
+      (recall (unwrap! (map-get? recalls { recall-id: recall-id }) ERR_RECALL_NOT_FOUND))
+      (caller-info (unwrap! (map-get? participant-by-address { address: tx-sender }) ERR_UNAUTHORIZED))
+      (participant-id (get participant-id caller-info))
+      (notification-key { recall-id: recall-id, participant-id: participant-id })
+      (existing-notification (default-to { notified: false, acknowledged: false, acknowledgment-date: none } (map-get? recall-notifications notification-key)))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (get acknowledged existing-notification)) ERR_ALREADY_REGISTERED)
+    
+    (map-set recall-notifications
+      notification-key
+      {
+        notified: true,
+        acknowledged: true,
+        acknowledgment-date: (some current-block)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-recall (recall-id uint))
+  (let
+    (
+      (recall (unwrap! (map-get? recalls { recall-id: recall-id }) ERR_RECALL_NOT_FOUND))
+      (caller-info (unwrap! (map-get? participant-by-address { address: tx-sender }) ERR_UNAUTHORIZED))
+      (participant-id (get participant-id caller-info))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq (get initiator recall) participant-id)) ERR_UNAUTHORIZED)
+    (asserts! (not (get resolved recall)) ERR_INVALID_STATUS)
+    
+    (map-set recalls
+      { recall-id: recall-id }
+      (merge recall {
+        status: "resolved",
+        resolved: true
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-product-recall-status (product-id uint))
+  (match (map-get? products { product-id: product-id })
+    product (is-eq (get status product) "recalled")
+    false
+  )
+)
+
+(define-read-only (get-active-recalls)
+  (ok (filter is-recall-active (enumerate-recalls)))
+)
+
+(define-private (enumerate-recalls)
+  (map get-recall-id (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20))
+)
+
+(define-private (get-recall-id (id uint))
+  id
+)
+
+(define-private (is-recall-active (recall-id uint))
+  (match (map-get? recalls { recall-id: recall-id })
+    recall (and (is-eq (get status recall) "active") (not (get resolved recall)))
+    false
+  )
+)
+
 (define-read-only (get-contract-info)
   {
     total-participants: (var-get next-participant-id),
     total-products: (var-get next-product-id),
     total-transfers: (var-get next-transfer-id),
+    total-recalls: (var-get next-recall-id),
     contract-owner: CONTRACT_OWNER
   }
 )
