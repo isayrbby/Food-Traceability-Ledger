@@ -9,11 +9,15 @@
 (define-constant ERR_RECALL_EXISTS (err u107))
 (define-constant ERR_RECALL_NOT_FOUND (err u108))
 (define-constant ERR_INVALID_SEVERITY (err u109))
+(define-constant ERR_BATCH_NOT_FOUND (err u110))
+(define-constant ERR_NO_PRODUCTS_IN_BATCH (err u111))
+(define-constant ERR_INVALID_BATCH (err u112))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-participant-id uint u1)
 (define-data-var next-transfer-id uint u1)
 (define-data-var next-recall-id uint u1)
+(define-data-var next-batch-id uint u1)
 
 (define-map participants
   { participant-id: uint }
@@ -99,6 +103,38 @@
   }
 )
 
+(define-map batch-info
+  { batch-number: (string-ascii 50) }
+  {
+    batch-id: uint,
+    origin-farm: uint,
+    creation-block: uint,
+    total-products: uint,
+    active-products: uint,
+    recalled-products: uint,
+    avg-quality-score: uint,
+    quality-checks-count: uint,
+    total-quality-score: uint,
+    failed-checks: uint
+  }
+)
+
+(define-map batch-products
+  { batch-number: (string-ascii 50), product-index: uint }
+  { product-id: uint }
+)
+
+(define-map batch-analytics
+  { batch-number: (string-ascii 50) }
+  {
+    total-transfers: uint,
+    unique-participants: uint,
+    avg-transfer-time: uint,
+    quality-failure-rate: uint,
+    last-updated: uint
+  }
+)
+
 (define-public (register-participant (participant-type (string-ascii 20)) (name (string-ascii 100)) (location (string-ascii 200)))
   (let (
     (participant-id (var-get next-participant-id))
@@ -172,6 +208,8 @@
       { product-id: product-id }
       { count: u0 }
     )
+    
+    (update-batch-on-product-creation batch-number participant-id product-id current-block)
     
     (var-set next-product-id (+ product-id u1))
     (ok product-id)
@@ -253,6 +291,8 @@
         status: (if passed "quality-passed" "quality-failed")
       })
     )
+    
+    (update-batch-quality (get batch-number product) quality-score passed)
     
     (ok record-id)
   )
@@ -377,6 +417,8 @@
       (merge product { status: "recalled" })
     )
     
+    (update-batch-recall-count (get batch-number product))
+    
     (var-set next-recall-id (+ recall-id u1))
     (ok recall-id)
   )
@@ -461,6 +503,274 @@
     total-products: (var-get next-product-id),
     total-transfers: (var-get next-transfer-id),
     total-recalls: (var-get next-recall-id),
+    total-batches: (var-get next-batch-id),
     contract-owner: CONTRACT_OWNER
   }
+)
+
+(define-private (update-batch-on-product-creation
+  (batch-number (string-ascii 50))
+  (origin-farm uint)
+  (product-id uint)
+  (current-block uint)
+)
+  (let
+    (
+      (existing-batch (map-get? batch-info { batch-number: batch-number }))
+    )
+    (match existing-batch
+      batch
+        (begin
+          (map-set batch-info
+            { batch-number: batch-number }
+            (merge batch {
+              total-products: (+ (get total-products batch) u1),
+              active-products: (+ (get active-products batch) u1)
+            })
+          )
+          (map-set batch-products
+            { batch-number: batch-number, product-index: (get total-products batch) }
+            { product-id: product-id }
+          )
+        )
+      (begin
+        (let
+          (
+            (new-batch-id (var-get next-batch-id))
+          )
+          (map-set batch-info
+            { batch-number: batch-number }
+            {
+              batch-id: new-batch-id,
+              origin-farm: origin-farm,
+              creation-block: current-block,
+              total-products: u1,
+              active-products: u1,
+              recalled-products: u0,
+              avg-quality-score: u100,
+              quality-checks-count: u0,
+              total-quality-score: u0,
+              failed-checks: u0
+            }
+          )
+          (map-set batch-products
+            { batch-number: batch-number, product-index: u0 }
+            { product-id: product-id }
+          )
+          (map-set batch-analytics
+            { batch-number: batch-number }
+            {
+              total-transfers: u0,
+              unique-participants: u1,
+              avg-transfer-time: u0,
+              quality-failure-rate: u0,
+              last-updated: current-block
+            }
+          )
+          (var-set next-batch-id (+ new-batch-id u1))
+        )
+      )
+    )
+  )
+)
+
+(define-private (update-batch-quality
+  (batch-number (string-ascii 50))
+  (quality-score uint)
+  (passed bool)
+)
+  (match (map-get? batch-info { batch-number: batch-number })
+    batch
+      (let
+        (
+          (new-quality-checks (+ (get quality-checks-count batch) u1))
+          (new-total-quality (+ (get total-quality-score batch) quality-score))
+          (new-failed (if passed (get failed-checks batch) (+ (get failed-checks batch) u1)))
+          (new-avg (/ new-total-quality new-quality-checks))
+        )
+        (map-set batch-info
+          { batch-number: batch-number }
+          (merge batch {
+            quality-checks-count: new-quality-checks,
+            total-quality-score: new-total-quality,
+            avg-quality-score: new-avg,
+            failed-checks: new-failed
+          })
+        )
+        (match (map-get? batch-analytics { batch-number: batch-number })
+          analytics
+            (let
+              (
+                (failure-rate (if (> new-quality-checks u0)
+                  (/ (* new-failed u100) new-quality-checks)
+                  u0))
+              )
+              (map-set batch-analytics
+                { batch-number: batch-number }
+                (merge analytics {
+                  quality-failure-rate: failure-rate,
+                  last-updated: stacks-block-height
+                })
+              )
+            )
+          true
+        )
+      )
+    true
+  )
+)
+
+(define-private (update-batch-recall-count (batch-number (string-ascii 50)))
+  (match (map-get? batch-info { batch-number: batch-number })
+    batch
+      (map-set batch-info
+        { batch-number: batch-number }
+        (merge batch {
+          recalled-products: (+ (get recalled-products batch) u1),
+          active-products: (- (get active-products batch) u1)
+        })
+      )
+    true
+  )
+)
+
+(define-public (initiate-batch-recall
+  (batch-number (string-ascii 50))
+  (reason (string-ascii 500))
+  (severity-level uint)
+)
+  (let
+    (
+      (batch (unwrap! (map-get? batch-info { batch-number: batch-number }) ERR_BATCH_NOT_FOUND))
+      (caller-info (unwrap! (map-get? participant-by-address { address: tx-sender }) ERR_UNAUTHORIZED))
+      (initiator-id (get participant-id caller-info))
+      (total-products (get total-products batch))
+    )
+    (asserts! (<= severity-level u5) ERR_INVALID_SEVERITY)
+    (asserts! (> (len reason) u0) ERR_INVALID_STATUS)
+    (asserts! (> total-products u0) ERR_NO_PRODUCTS_IN_BATCH)
+    
+    (recall-batch-products batch-number total-products initiator-id reason severity-level)
+  )
+)
+
+(define-private (recall-batch-products
+  (batch-number (string-ascii 50))
+  (total-products uint)
+  (initiator-id uint)
+  (reason (string-ascii 500))
+  (severity-level uint)
+)
+  (begin
+    (fold recall-single-product-in-batch
+      (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19)
+      { batch: batch-number, max: total-products, initiator: initiator-id, reason: reason, severity: severity-level }
+    )
+    (ok total-products)
+  )
+)
+
+(define-private (recall-single-product-in-batch
+  (index uint)
+  (context { batch: (string-ascii 50), max: uint, initiator: uint, reason: (string-ascii 500), severity: uint })
+)
+  (if (< index (get max context))
+    (match (map-get? batch-products { batch-number: (get batch context), product-index: index })
+      product-info
+        (let
+          (
+            (product-id (get product-id product-info))
+          )
+          (match (map-get? products { product-id: product-id })
+            product
+              (let
+                (
+                  (recall-id (var-get next-recall-id))
+                  (current-block stacks-block-height)
+                )
+                (map-set recalls
+                  { recall-id: recall-id }
+                  {
+                    product-id: product-id,
+                    initiator: (get initiator context),
+                    reason: (get reason context),
+                    severity-level: (get severity context),
+                    recall-date: current-block,
+                    status: "active",
+                    affected-participants: (list),
+                    resolved: false
+                  }
+                )
+                (map-set products
+                  { product-id: product-id }
+                  (merge product { status: "recalled" })
+                )
+                (var-set next-recall-id (+ recall-id u1))
+                context
+              )
+            context
+          )
+        )
+      context
+    )
+    context
+  )
+)
+
+(define-read-only (get-batch-info (batch-number (string-ascii 50)))
+  (map-get? batch-info { batch-number: batch-number })
+)
+
+(define-read-only (get-batch-analytics (batch-number (string-ascii 50)))
+  (map-get? batch-analytics { batch-number: batch-number })
+)
+
+(define-read-only (get-batch-product (batch-number (string-ascii 50)) (product-index uint))
+  (map-get? batch-products { batch-number: batch-number, product-index: product-index })
+)
+
+(define-read-only (get-batch-quality-summary (batch-number (string-ascii 50)))
+  (match (map-get? batch-info { batch-number: batch-number })
+    batch
+      (ok {
+        avg-quality-score: (get avg-quality-score batch),
+        quality-checks-count: (get quality-checks-count batch),
+        failed-checks: (get failed-checks batch),
+        pass-rate: (if (> (get quality-checks-count batch) u0)
+          (- u100 (/ (* (get failed-checks batch) u100) (get quality-checks-count batch)))
+          u100)
+      })
+    ERR_BATCH_NOT_FOUND
+  )
+)
+
+(define-read-only (get-batch-status (batch-number (string-ascii 50)))
+  (match (map-get? batch-info { batch-number: batch-number })
+    batch
+      (ok {
+        total-products: (get total-products batch),
+        active-products: (get active-products batch),
+        recalled-products: (get recalled-products batch),
+        recall-rate: (if (> (get total-products batch) u0)
+          (/ (* (get recalled-products batch) u100) (get total-products batch))
+          u0)
+      })
+    ERR_BATCH_NOT_FOUND
+  )
+)
+
+(define-read-only (is-batch-safe (batch-number (string-ascii 50)))
+  (match (map-get? batch-info { batch-number: batch-number })
+    batch
+      (let
+        (
+          (avg-quality (get avg-quality-score batch))
+          (recall-rate (if (> (get total-products batch) u0)
+            (/ (* (get recalled-products batch) u100) (get total-products batch))
+            u0))
+        )
+        (ok (and (>= avg-quality u70) (<= recall-rate u10)))
+      )
+    ERR_BATCH_NOT_FOUND
+  )
 )
